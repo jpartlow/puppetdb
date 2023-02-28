@@ -46,13 +46,15 @@
             [puppetlabs.puppetdb.utils :as utils :refer [println-err]]
             [puppetlabs.kitchensink.core :as kitchensink]
             [puppetlabs.puppetdb.client :as client]
-            [puppetlabs.puppetdb.random :refer [random-string random-bool]]
+            [puppetlabs.puppetdb.random :refer [random-string random-bool random-resource]]
             [puppetlabs.puppetdb.time :as time :refer [now]]
             [puppetlabs.puppetdb.archive :as archive]
             [clojure.core.async :refer [go go-loop <! <!! chan] :as async]
             [taoensso.nippy :as nippy]
             [puppetlabs.i18n.core :refer [trs]]
-            [puppetlabs.puppetdb.nio :refer [get-path]])
+            [puppetlabs.puppetdb.nio :refer [get-path]]
+            [clojure.data.generators :as dgen]
+            [puppetlabs.puppetdb.catalogs :as cat])
   (:import
    [clojure.core.async.impl.protocols Buffer UnblockingBuffer]
    [java.nio.file.attribute FileAttribute]
@@ -94,6 +96,10 @@
    catutils/add-random-edge-to-wire-catalog
    catutils/swap-edge-targets-in-wire-catalog])
 
+(defn random-sha1
+  []
+  (kitchensink/utf8-string->sha1 (random-string 100)))
+
 (defn add-catalog-varying-fields
   "This function adds the fields that change when there is a different
   catalog. code_id and catalog_uuid should be different whenever the
@@ -101,7 +107,7 @@
   [catalog]
   (assoc catalog
          "catalog_uuid" (kitchensink/uuid)
-         "code_id" (kitchensink/utf8-string->sha1 (random-string 100))))
+         "code_id" (random-sha1)))
 
 (defn rand-catalog-mutation
   "Grabs one of the mutate-fns randomly and returns it"
@@ -261,6 +267,52 @@
   {:facts "puppetlabs/puppetdb/benchmark/samples/facts"
    :reports "puppetlabs/puppetdb/benchmark/samples/reports"
    :catalogs "puppetlabs/puppetdb/benchmark/samples/catalogs"})
+
+(defn generate-classes
+  [number]
+  (map (fn [i] (random-resource "Class" (str "class-" i))) (range number)))
+
+(defn generate-resources
+  [number title-size]
+  (map (fn [i] (random-resource (random-string) (random-string title-size))) (range number)))
+
+(defn generate-edge
+  ([source target]
+   (generate-edge source target "contains"))
+  ([source target relation]
+   {"source" (select-keys source ["type" "title"])
+    "target" (select-keys target ["type" "tilte"])
+    "relationship" relation}))
+
+(defn generate-edges
+  [main-stage classes resources]
+  (let [partitioned-resources (partition-all (count classes) resources)
+        ;; This looses the remainder resourcs atm...
+        class-map (zipmap classes partitioned-resources)]
+    (->> class-map
+         (map
+           (fn [[cls cls-resources]]
+             (concat
+               (list (generate-edge main-stage cls))
+               (map #(generate-edge cls %) cls-resources))))
+         flatten)))
+
+(defn generate-catalog
+  [num-classes, num-resources, title-size, _total-catalog-size, _depth]
+  (let [main-stage (random-resource "Stage" "main")
+        classes (generate-classes num-classes)
+        resources (generate-resources (- num-resources num-classes) title-size)
+        edges (generate-edges main-stage classes resources)]
+    {"resources" (cons main-stage resources)
+     "edges" edges
+     "producer_timestamp" (now)
+     "transaction_uuid" (kitchensink/uuid)
+     "certname" (format "host-%d" (rand-int 100))
+     "hash" (random-sha1)
+     "version" (quot (System/currentTimeMillis) 1000)
+     "producer" "puppetmaster1"
+     "catalog_uuid" (kitchensink/uuid)
+     "code_id" (random-sha1)}))
 
 (defn load-data-from-options
   [{:keys [archive] :as options}]
