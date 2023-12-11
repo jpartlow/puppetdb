@@ -84,6 +84,17 @@
    (java.util ArrayDeque)
    (java.util.concurrent RejectedExecutionException)))
 
+(defn total-mem [] (float (/ (.totalMemory (Runtime/getRuntime)) (* 1024 1024 1024))))
+(defn free-mem  [] (float (/ (.freeMemory (Runtime/getRuntime)) (* 1024 1024 1024))))
+(defn max-mem   [] (float (/ (.maxMemory (Runtime/getRuntime)) (* 1024 1024 1024))))
+(defn used-mem  [] (- (total-mem) (free-mem)))
+(defn total-free-mem [] (- (max-mem) (used-mem)))
+(defn mem-map [] {:max (max-mem)
+                  :total (total-mem)
+                  :free (free-mem)
+                  :used (used-mem)
+                  :total-free (total-free-mem)})
+
 (defn- ssl-info->context
   [& {:keys [ssl-cert ssl-key ssl-ca-cert]}]
   (SSLUtils/pemsToSSLContext (io/reader ssl-cert)
@@ -539,6 +550,7 @@
     (for [i (range n)]
       (let [host (str "host-" (+ offset i))
             preserved (get host-map-index host)]
+        (println (format "Init host %s heap in gigs: %s" host (mem-map) ))
         (if preserved
           ;; Adjust the preserved host-map to match current flags.
           (let [updated
@@ -571,6 +583,7 @@
 (defn recover-preserved-host-maps
   "Given a Path to a directory, returns an array of all thawed host-* host maps."
   [storage-dir]
+  (println (format "About to recover host-maps heap in gigs: %s" (mem-map) ))
   (->> (fs/glob (.resolve storage-dir "host-*"))
        (map #(nippy/thaw (Files/readAllBytes (.toPath %))))))
 
@@ -582,10 +595,13 @@
      (recover-and-generate-host-maps n offset pdb-host include-edges
                                      catalogs reports facts storage-dir hosts)))
   ([n offset pdb-host include-edges catalogs reports facts _ hosts]
+   (println (format "Generating index of host-maps heap in gigs: %s" (mem-map) ))
    (let [host-map-index (reduce (fn [m i]
                                   (let [certname (:host i)]
+     (println (format "Generated index of %s heap in gigs: %s" certname (mem-map) ))
                                     (assoc m certname i)))
                                 {} hosts)]
+     (println (format "Generated index of host-maps heap in gigs: %s" (mem-map) ))
      (random-hosts n offset pdb-host include-edges catalogs reports facts host-map-index))))
 
 (defn progressing-timestamp
