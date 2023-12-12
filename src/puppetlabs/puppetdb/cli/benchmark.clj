@@ -581,13 +581,12 @@
         (if (contains? preserved-host-map-keys host)
 
           ;; Then provide a function that the simulation loop can later use to
-          ;; load the preserved host-map and adjust it according to current
-          ;; user flags. Deferring loading of all preserved host-maps at
-          ;; initialization prevents us from blowing up the heap.
+          ;; adjust the preserved host-map according to current user flags.
+          ;; Deferring loading of all preserved host-maps at initialization
+          ;; prevents us from blowing up the heap.
           (let [update-preserved-fn
-                 (fn []
-                   (let [preserved (get-preserved-host-map storage-dir host)
-                         ;; Adjust the preserved host-map to match current flags.
+                 (fn [preserved]
+                   (let [;; Adjust the preserved host-map to match current flags.
                          updated
                            (cond-> preserved
                                    ;; Update missing entries where possible.
@@ -611,6 +610,7 @@
                        updated
                        (assoc-in updated [:catalog "edges"] []))))]
             {:host host
+             :storage-dir storage-dir
              :update-preserved-fn update-preserved-fn})
 
           ;; Otherwise generate new random host-map
@@ -660,7 +660,10 @@
                     (if-let [update-preserved-fn (:update-preserved-fn host-state)]
                       ;; execute the deferred function to initialize this host-map
                       ;; from the contents of the preserved file in --simulation-dir
-                      (update-preserved-fn)
+                      (let [preserved (get-preserved-host-map
+                                        (:storage-dir host-state)
+                                        (:host host-state))]
+                        (update-preserved-fn preserved))
                       host-state)
                   updated-host
                     (update-host new-host include-edges rand-perc progressing-timestamp-fn)]
@@ -668,7 +671,7 @@
               (when (and (not num-msgs)
                          (> deadline (time/ephemeral-now-ns)))
                 ;; sleep until deadline
-                (Thread/sleep (int (/  (- deadline (time/ephemeral-now-ns)) 1000000))))
+                (Thread/sleep (int (/ (- deadline (time/ephemeral-now-ns)) 1000000))))
               updated-host)))
      read-ch)))
 
