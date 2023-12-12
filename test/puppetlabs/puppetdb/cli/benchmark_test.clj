@@ -294,6 +294,12 @@
         symbol-keys (filter (fn [[_ is-string]] (not is-string)) checked-keys)]
     (is (empty? symbol-keys) "Mutating a catalog unexpectedly produced these keys as symbols instead of strings.")))
 
+(defn recover-preserved-host-maps
+  "Given a Path to a directory, returns an array of all thawed host-* host maps."
+  [storage-dir]
+  (->> (fs/glob (.resolve storage-dir "host-*"))
+       (map #(nippy/thaw (Files/readAllBytes (.toPath %))))))
+
 (deftest recover-and-generate-host-maps-test
   (let [catalogs [{"certname" "foo" "edges" [{"a" "b"}] "resources" [{"tags" ["a"]}]}
                   {"certname" "bar" "edges" [{"a" "b"}] "resources" [{"tags" ["a"]}]}
@@ -436,7 +442,7 @@
                                      "--numhosts" "10"
                                      "--nummsgs" "1"
                                      "--simulation-dir" (str simulation-path))
-        preserved-host-maps (benchmark/recover-preserved-host-maps simulation-path)]
+        preserved-host-maps (recover-preserved-host-maps simulation-path)]
     (is (= 30 (count submitted)))
     (is (= 10 (count preserved-host-maps)))
     (testing "re-running benchmark uses preserved state"

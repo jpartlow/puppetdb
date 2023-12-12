@@ -80,7 +80,7 @@
                   HttpRequest$BodyPublishers
                   HttpResponse$BodyHandlers)
    (java.nio.file.attribute FileAttribute)
-   (java.nio.file FileAlreadyExistsException Files LinkOption OpenOption)
+   (java.nio.file FileAlreadyExistsException Files LinkOption OpenOption StandardCopyOption)
    (java.util ArrayDeque)
    (java.util.concurrent RejectedExecutionException)))
 
@@ -485,14 +485,19 @@
   ;;   nil
   (go (delete-dir-or-report storage-dir)))
 
-(defn defer-file-buffer-item [path item]
-  (let [out (Files/newOutputStream path (into-array OpenOption []))]
+(defn defer-file-buffer-item [tmp-path final-path item]
+  (let [out (Files/newOutputStream tmp-path (into-array OpenOption []))]
     (go
       (try
         (with-open [in (io/input-stream (nippy/freeze item))]
           (io/copy in out))
-        path
-        (finally (.close out))))))
+        final-path
+        (finally
+          (.close out)
+          (when-not (= tmp-path final-path)
+            (fs/move tmp-path final-path
+                     (StandardCopyOption/ATOMIC_MOVE)
+                     (StandardCopyOption/REPLACE_EXISTING))))))))
 
 (deftype TempFileBuffer [storage-dir q ephemeral?]
   UnblockingBuffer
@@ -505,9 +510,13 @@
       result))
 
   (add!* [_ item]
-    (let [path (Files/createTempFile storage-dir (format "%s-" (:host item)) ""
-                                     (into-array FileAttribute []))
-          ch (defer-file-buffer-item path item)]
+    (let [host (:host item)
+          tmp-path (Files/createTempFile storage-dir (format "tmp-%s-" host) ""
+                                         (into-array FileAttribute []))
+          final-path (if ephemeral?
+                       tmp-path
+                       (.resolve storage-dir host))
+          ch (defer-file-buffer-item tmp-path final-path item)]
       (.add q ch)))
 
   (close-buf! [_]
@@ -532,9 +541,28 @@
   (let [q (ArrayDeque. expected-size)]
     (TempFileBuffer. storage-dir q ephemeral?)))
 
+(defn get-host-map-keys
+  "Given a Path to a --simulation-dir directory, returns an array of all
+  preserved host-map files.
+
+  These files are named 'host-<number>'. It ignores temporary files like
+  'tmp-host-<number>-<timestamp>'."
+  [storage-dir]
+  (->> (fs/glob (.resolve storage-dir "host-*"))
+       (reduce #(conj %1 (.getName %2))
+               #{})))
+
+(defn get-preserved-host-map
+  [storage-dir certname]
+  (let [host-map-path (-> (.resolve storage-dir certname)
+                          (fs/glob)
+                          first)]
+    (nippy/thaw (Files/readAllBytes (.toPath host-map-path)))))
+
 (defn random-hosts
-  [n offset pdb-host include-edges catalogs reports facts host-map-index]
-  (let [random-entity (fn [host entities]
+  [n offset pdb-host include-edges catalogs reports facts storage-dir]
+  (let [preserved-host-map-keys (get-host-map-keys storage-dir)
+        random-entity (fn [host entities]
                         (some-> entities
                                 rand-nth
                                 (assoc "certname" host)))
@@ -548,61 +576,48 @@
                                                          conj
                                                          pdb-host)))))]
     (for [i (range n)]
-      (let [host (str "host-" (+ offset i))
-            preserved (get host-map-index host)]
-        (println (format "Init host %s heap in gigs: %s" host (mem-map) ))
-        (if preserved
-          ;; Adjust the preserved host-map to match current flags.
-          (let [updated
-                 (cond-> preserved
-                         ;; Update missing entries where possible.
-                         (nil? (:catalog preserved))
-                           (assoc :catalog (random-catalog host pdb-host catalogs))
-                         (nil? (:factset preserved))
-                           (assoc :factset (random-entity host facts))
-                         (nil? (:report preserved))
-                           (assoc :report (random-entity host reports))
-                         ;; Remove preserved entries where required.
-                         ;; (preserved data may include entries that do not match the
-                         ;; currently requested data from --facts, --catalogs,
-                         ;; --reports or --archive...)
-                         (nil? catalogs) (assoc :catalog nil)
-                         (nil? facts) (assoc :factset nil)
-                         (nil? reports) (assoc :report nil))]
-            ;; Respect include-edges
-            (if (or include-edges
-                    (nil? (:catalog updated)))
-              updated
-              (assoc-in updated [:catalog "edges"] [])))
+      (let [host (str "host-" (+ offset i))]
+        (println (format "Init random-host %s heap in gigs: %s" host (mem-map) ))
+        (if (contains? preserved-host-map-keys host)
+
+          ;; Then provide a function that the simulation loop can later use to
+          ;; load the preserved host-map and adjust it according to current
+          ;; user flags. Deferring loading of all preserved host-maps at
+          ;; initialization prevents us from blowing up the heap.
+          (let [update-preserved-fn
+                 (fn []
+                   (let [preserved (get-preserved-host-map storage-dir host)
+                         ;; Adjust the preserved host-map to match current flags.
+                         updated
+                           (cond-> preserved
+                                   ;; Update missing entries where possible.
+                                   (nil? (:catalog preserved))
+                                     (assoc :catalog (random-catalog host pdb-host catalogs))
+                                   (nil? (:factset preserved))
+                                     (assoc :factset (random-entity host facts))
+                                   (nil? (:report preserved))
+                                     (assoc :report (random-entity host reports))
+                                   ;; Remove preserved entries where required.
+                                   ;; (preserved data may include entries that
+                                   ;; do not match the currently requested data
+                                   ;; from --facts, --catalogs, --reports or
+                                   ;; --archive...)
+                                   (nil? catalogs) (assoc :catalog nil)
+                                   (nil? facts) (assoc :factset nil)
+                                   (nil? reports) (assoc :report nil))]
+                     ;; Respect include-edges
+                     (if (or include-edges
+                             (nil? (:catalog updated)))
+                       updated
+                       (assoc-in updated [:catalog "edges"] []))))]
+            {:host host
+             :update-preserved-fn update-preserved-fn})
+
           ;; Otherwise generate new random host-map
           {:host host
            :catalog (random-catalog host pdb-host catalogs)
            :report (random-entity host reports)
            :factset (random-entity host facts)})))))
-
-(defn recover-preserved-host-maps
-  "Given a Path to a directory, returns an array of all thawed host-* host maps."
-  [storage-dir]
-  (println (format "About to recover host-maps heap in gigs: %s" (mem-map) ))
-  (->> (fs/glob (.resolve storage-dir "host-*"))
-       (map #(nippy/thaw (Files/readAllBytes (.toPath %))))))
-
-(defn recover-and-generate-host-maps
-  "Wrapper around random-hosts to read any preserved state from the storage-dir
-  before generating any additional random-hosts that may be needed."
-  ([n offset pdb-host include-edges catalogs reports facts storage-dir]
-   (let [hosts (recover-preserved-host-maps storage-dir)]
-     (recover-and-generate-host-maps n offset pdb-host include-edges
-                                     catalogs reports facts storage-dir hosts)))
-  ([n offset pdb-host include-edges catalogs reports facts _ hosts]
-   (println (format "Generating index of host-maps heap in gigs: %s" (mem-map) ))
-   (let [host-map-index (reduce (fn [m i]
-                                  (let [certname (:host i)]
-     (println (format "Generated index of %s heap in gigs: %s" certname (mem-map) ))
-                                    (assoc m certname i)))
-                                {} hosts)]
-     (println (format "Generated index of host-maps heap in gigs: %s" (mem-map) ))
-     (random-hosts n offset pdb-host include-edges catalogs reports facts host-map-index))))
 
 (defn progressing-timestamp
   "Return a function that will return a timestamp that progresses forward in time."
@@ -641,12 +656,20 @@
      write-ch
      (map (fn [host-state]
             (let [deadline (+ (time/ephemeral-now-ns) (* ms-per-thread 1000000))
-                  new-host (update-host host-state include-edges rand-perc progressing-timestamp-fn)]
+                  new-host
+                    (if-let [update-preserved-fn (:update-preserved-fn host-state)]
+                      ;; execute the deferred function to initialize this host-map
+                      ;; from the contents of the preserved file in --simulation-dir
+                      (update-preserved-fn)
+                      host-state)
+                  updated-host
+                    (update-host new-host include-edges rand-perc progressing-timestamp-fn)]
+              (println (format "simulation-loop host %s heap in gigs: %s" (:host updated-host) (mem-map)))
               (when (and (not num-msgs)
                          (> deadline (time/ephemeral-now-ns)))
                 ;; sleep until deadline
                 (Thread/sleep (int (/  (- deadline (time/ephemeral-now-ns)) 1000000))))
-              new-host)))
+              updated-host)))
      read-ch)))
 
 (defn warn-missing-data [catalogs reports facts]
@@ -757,10 +780,8 @@
 
         ;; channels
         initial-hosts-ch (async/to-chan!
-                          (recover-and-generate-host-maps numhosts offset pdb-host
-                                                          include-catalog-edges
-                                                          catalogs reports facts
-                                                          storage-dir))
+                          (random-hosts numhosts offset pdb-host include-catalog-edges
+                                        catalogs reports facts storage-dir))
         mq-ch (chan (message-buffer storage-dir numhosts (nil? simulation-dir)))
         _ (register-shutdown-hook! #(async/close! mq-ch))
 
